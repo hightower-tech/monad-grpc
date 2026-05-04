@@ -1,0 +1,542 @@
+syntax = "proto3";
+
+package monad.grpc.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Monad — production gRPC streaming for execution & consensus events.
+//
+// The protocol is backwards-compatible within `monad.grpc.v1`; new fields
+// are added with new tag numbers, removed fields stay reserved.
+service Monad {
+  // Bidirectional streaming subscription. The client sends SubscribeRequest
+  // (and may resend to update filters or ping); the server streams matching
+  // SubscribeUpdate values.
+  rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeUpdate);
+
+  // Lightweight unary reachability probe.
+  rpc Ping(PingRequest) returns (PongResponse);
+
+  // Server / SDK / proto version metadata.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+}
+
+// ─── BlockStage ────────────────────────────────────────────────────
+//
+// Numeric values must stay stable across releases — additions go at the
+// end with new tag numbers.
+//
+// Happy path: PROPOSED → VOTED → FINALIZED → VERIFIED.
+// Failure path: REJECTED (terminal, reachable from any earlier stage).
+enum BlockStage {
+  BLOCK_STAGE_UNSPECIFIED = 0;
+  BLOCK_STAGE_PROPOSED    = 1;
+  BLOCK_STAGE_VOTED       = 2;
+  BLOCK_STAGE_FINALIZED   = 3;
+  BLOCK_STAGE_VERIFIED    = 4;
+  BLOCK_STAGE_REJECTED    = 5;
+}
+
+// ─── AbandonReason ─────────────────────────────────────────────────
+//
+// Why a block ended up at stage = REJECTED. Populated only on
+// UpdateBlockMeta with stage = BLOCK_STAGE_REJECTED.
+enum AbandonReason {
+  ABANDON_REASON_UNSPECIFIED          = 0;
+  // Explicit BlockReject event from execution; consensus rejected the proposal.
+  ABANDON_REASON_EXPLICIT_REJECT      = 1;
+  // No BlockReject — sibling proposal was finalized first; this block lost
+  // the race. Detected when a Finalized event arrives for a sibling at the
+  // same block_number.
+  ABANDON_REASON_IMPLICITLY_ABANDONED = 2;
+  // Server-side watchdog: block stayed at PROPOSED past the configured
+  // timeout without any QC / finalization / explicit reject.
+  ABANDON_REASON_TIMEOUT              = 3;
+}
+
+// ─── Filters ───────────────────────────────────────────────────────
+//
+// Filter semantics (Yellowstone-style named filters):
+//   - SubscribeRequest carries a `map<string, FilterX>` per event type.
+//     Each named filter is independent — a single event delivers iff ANY
+//     named filter of the appropriate type matches it. The names of all
+//     matching filters are returned in SubscribeUpdate.filters so the
+//     client can route by name without re-running the match.
+//   - Within one named filter: AND across populated fields. Empty
+//     repeated fields are wildcards (don't constrain).
+//   - Across types (transactions vs logs vs call_frames vs state_access):
+//     each event type is gated only by its own filter map.
+
+// Encoding convention for byte-typed values:
+//   - All addresses, hashes, and bytestrings travel as 0x-prefixed lowercase
+//     hex strings (Ethereum JSON-RPC convention). Example address:
+//     "0x6f49a8f6213531f31237823046e7d7e4b9b249dc"
+//   - All U256 values travel as 0x-prefixed hex with no leading-zero padding.
+//     Example: "0xde0b6b3a7640000".
+//   - Filters accept the same format. Server normalises to lowercase on
+//     SubscribeRequest receipt; clients can safely upper/lower-case input.
+
+// Stage gating semantics (uniform across every Filter* message):
+//   - `min_stage` (BlockStage): floor. Events whose stage is strictly
+//     below this value are dropped. UNSPECIFIED (default) = no floor.
+//   - `stages` (repeated BlockStage): exact-match whitelist. When
+//     non-empty, ONLY these stages are delivered (yellowstone-style
+//     fixed-commitment); `min_stage` is ignored. When empty, the
+//     `min_stage` floor applies.
+//
+// Same pattern shows up in transactions / logs / call_frames /
+// state_access / block_meta / block_end / blocks. There's no global
+// stage gate on SubscribeRequest — every named filter decides its own
+// finality requirement, so a single subscription can fan out an early
+// peek (PROPOSED) plus a committed snapshot (FINALIZED) at once.
+
+message FilterTransactions {
+  // Match if sender (from-address) is in this list. Hex 0x-strings, 20 bytes.
+  repeated string sender = 2;
+  // Match if `to` is in this list. Hex 0x-strings, 20 bytes.
+  repeated string to = 3;
+  // Match if first 4 bytes of input data equal one of these (function selector).
+  // Hex 0x-strings of exactly 4 bytes (10 chars including 0x).
+  repeated string function_selector = 4;
+  // Match if txn_hash equals one of these. Hex 0x-strings, 32 bytes.
+  // (Only effective for UpdateTxnHeader — receipts/logs would need correlate=true.)
+  repeated string signature = 5;
+
+  BlockStage min_stage = 6;
+  repeated BlockStage stages = 7;
+
+  // When true, deliver only TxnHeader entries with value != 0. Use this
+  // on subscriptions dedicated to balance tracking (combine with
+  // `to: [...]` for a wallet watch). Server-side filter on the existing
+  // `transactions` stream — no new event type, no synthesis.
+  //
+  // Comprehensive coverage: catches EOA→EOA transfers, contract calls
+  // forwarding ETH (msg.value > 0), and contract-creation with value.
+  // SDK does NOT emit a TxnCallFrame for protocol-level transfers
+  // (no EVM execution), so a raw `call_frames` filter cannot reach
+  // them — `value_transfers_only` is the right hook.
+  bool value_transfers_only = 8;
+}
+
+message FilterLogs {
+  // Match if log address is in this list. Hex 0x-strings, 20 bytes.
+  repeated string address = 2;
+  // Match topic[0] (event signature). Hex 0x-strings, 32 bytes each.
+  repeated string topic0 = 3;
+  repeated string topic1 = 4;
+  repeated string topic2 = 5;
+
+  BlockStage min_stage = 6;
+  repeated BlockStage stages = 7;
+}
+
+message FilterCallFrames {
+  // Drop frames deeper than this. 0 means "no cap" (the typical default).
+  // Use 1 to get top-level frames only.
+  uint32 max_depth = 2;
+
+  // Match if call_target is in this list. Hex 0x-strings, 20 bytes.
+  repeated string call_target = 3;
+  // Match if caller is in this list. Hex 0x-strings, 20 bytes.
+  repeated string caller = 4;
+
+  BlockStage min_stage = 5;
+  repeated BlockStage stages = 6;
+}
+
+message FilterStateAccess {
+  // Match if account address is in this list. Hex 0x-strings, 20 bytes.
+  // Applies to both UpdateAccountAccess (own address) and UpdateStorageAccess
+  // (the address whose slot is being touched, derived from account_index).
+  repeated string address = 2;
+
+  // Match if storage key is in this list. Hex 0x-strings, 32 bytes.
+  // Only constrains UpdateStorageAccess.
+  repeated string storage_key = 3;
+
+  BlockStage min_stage = 4;
+  repeated BlockStage stages = 5;
+}
+
+// Toggle filters — presence of a named entry in the corresponding map
+// activates that event type. The name still flows through to
+// SubscribeUpdate.filters for client-side routing. `min_stage` /
+// `stages` apply per-named-filter, same semantics as the value-bearing
+// filters above; defaults (UNSPECIFIED + empty stages) mean "deliver
+// every stage transition for this name".
+message FilterBlockMeta {
+  BlockStage min_stage = 1;
+  repeated BlockStage stages = 2;
+}
+message FilterBlockEnd {
+  BlockStage min_stage = 1;
+  repeated BlockStage stages = 2;
+}
+
+// Composite block delivery filter. The composite stream emits one
+// UpdateBlock per stage transition (PROPOSED → VOTED → FINALIZED →
+// VERIFIED, plus REJECTED on implicit abandon). Per-filter stage
+// gating lets a single subscription fan out multiple finality tiers:
+//   blocks: {
+//     "early":      { min_stage: BLOCK_STAGE_PROPOSED },   // peek
+//     "committed":  { min_stage: BLOCK_STAGE_FINALIZED },  // accounting
+//     "voted_only": { stages: [BLOCK_STAGE_VOTED] },       // exact stage
+//   }
+message FilterBlock {
+  BlockStage min_stage = 1;
+  repeated BlockStage stages = 2;
+}
+
+// ─── Additional event subscriptions ────────────────────────────────
+//
+// Stage coverage: both TxnReject and EvmError are emitted ONLY at
+// PROPOSED. The SDK's reassembled ExecutedBlock does not retain
+// reject codes or error codes, so they can't be re-emitted at later
+// stages. Subscribers who need accounting-grade delivery should pair
+// these filters with a `transactions` / `block_meta` filter at
+// FINALIZED to bound the relevant block-id, then look up the rejects
+// / errors that arrived at PROPOSED for that block.
+
+message FilterTxnRejects {
+  // Whitelist of SDK reject reason codes. Empty = wildcard (any reason
+  // is delivered). Non-empty = ONLY matching codes are delivered.
+  // Decoding the codes back to human strings is the client's job —
+  // see the SDK release notes for the current code mapping.
+  repeated uint32 reason = 1;
+
+  BlockStage min_stage = 2;
+  repeated BlockStage stages = 3;
+}
+
+message FilterEvmErrors {
+  // Whitelists of SDK numeric codes. Empty list = wildcard (any value).
+  // Non-empty = ONLY matching values are delivered. Decoding the
+  // codes back to human strings is the client's job — the SDK doesn't
+  // ship a reason string; the mapping evolves with the SDK release.
+  repeated uint64 domain_id   = 1;
+  repeated int64  status_code = 2;
+
+  BlockStage min_stage        = 3;
+  repeated BlockStage stages  = 4;
+}
+
+// ─── SubscribeRequest ──────────────────────────────────────────────
+message SubscribeRequest {
+  // Named per-event-type filters. Empty map = the corresponding event
+  // type is not delivered. See "Filter semantics" above.
+  map<string, FilterBlockMeta>    block_meta   = 1;
+  // tag 2 reserved (was a global min_stage; superseded by per-named-filter
+  // Filter*.min_stage / stages).
+
+  // Heartbeat from the client. When set, server responds with a Pong carrying
+  // the same nonce. Clears on each request — must be re-sent each time.
+  Ping ping = 3;
+
+  map<string, FilterTransactions> transactions = 4;
+  map<string, FilterLogs>         logs         = 5;
+  map<string, FilterCallFrames>   call_frames  = 6;
+  map<string, FilterBlockEnd>     block_end    = 7;
+  map<string, FilterStateAccess>  state_access = 8;
+
+  // Composite block delivery — one UpdateBlock per stage transition for
+  // each subscribed block, carrying every per-event update of the block
+  // grouped together. Use this for accounting-grade subscribers who want
+  // an atomic snapshot at a known stage rather than a real-time event
+  // stream.
+  map<string, FilterBlock>        blocks       = 9;
+
+  // Resume cursor. When set, the server replays all retained
+  // SubscribeUpdates whose seqno is strictly greater than this value
+  // before switching to live broadcast. Use the seqno of the last
+  // SubscribeUpdate the client successfully processed.
+  //
+  // Server requirements: --replay-buffer-capacity must be non-zero. If
+  // the requested seqno has been evicted from the retention window,
+  // the server responds with Status::FAILED_PRECONDITION and closes
+  // the stream — clients should reconnect from a more recent cursor
+  // (typically the oldest_available reported in the error message).
+  //
+  // Honored only on the FIRST SubscribeRequest of the stream;
+  // subsequent requests with from_seqno are ignored with a server-
+  // side warn log.
+  optional uint64 from_seqno = 10;
+
+  // When true, a TxnHeader matched by any `transactions` named filter
+  // also pulls every other event of the same transaction
+  // (UpdateTxnLog / UpdateTxnReceipt / UpdateCallFrame / state
+  // accesses with has_txn_index=true) — even when those wouldn't match
+  // the per-event filters on their own. The correlated events carry
+  // the originating named-filter's name(s) in `filters[]`, so the
+  // client routes them the same way as direct matches.
+  //
+  // The per-block correlation set is bounded (~64 in-flight blocks)
+  // and reset on UpdateBlockEnd or UpdateBlockMeta(stage=REJECTED).
+  // Designed for clients that want atomic per-txn delivery without
+  // subscribing to logs/receipts/calls separately.
+  bool correlate = 11;
+
+  // Additional event subscriptions.
+  map<string, FilterTxnRejects> txn_rejects = 12;
+  map<string, FilterEvmErrors>  evm_errors  = 13;
+
+  // tag 14 reserved (was native_transfers; superseded by
+  // FilterTransactions.value_transfers_only).
+  reserved 14;
+}
+
+// ─── SubscribeUpdate ───────────────────────────────────────────────
+message SubscribeUpdate {
+  // Monotonic event-ring seqno at the time this update was emitted.
+  // Use as the cursor for from_seqno replay.
+  uint64 seqno = 1;
+
+  // When the server constructed this update (server clock).
+  google.protobuf.Timestamp created_at = 2;
+
+  oneof update_oneof {
+    UpdateBlockMeta      block_meta       = 3;
+    Pong                 pong             = 4;
+    Ping                 ping             = 5;  // server-initiated heartbeat
+    UpdateTxnHeader      txn_header       = 6;
+    UpdateTxnLog         txn_log          = 7;
+    UpdateTxnReceipt     txn_receipt      = 8;
+    UpdateCallFrame      call_frame       = 9;
+    UpdateBlockEnd       block_end        = 10;
+    UpdateAccountAccess  account_access   = 11;
+    UpdateStorageAccess  storage_access   = 12;
+    UpdateBlock          block            = 14;  // composite block snapshot
+    UpdateTxnReject      txn_reject       = 15;  // validation-rejected transactions
+    UpdateEvmError       evm_error        = 16;
+  }
+
+  // Names of every client-supplied filter that matched this event.
+  // Yellowstone-style routing key: clients look up handlers by name,
+  // skipping a redundant client-side match pass.
+  repeated string filters = 13;
+
+  // tag 17 reserved (was UpdateNativeTransfer; use
+  // FilterTransactions.value_transfers_only on the UpdateTxnHeader
+  // stream instead).
+  reserved 17;
+}
+
+// ─── UpdateBlockMeta ───────────────────────────────────────────────
+//
+// One update per block-stage transition. Fields populated only when known
+// at the corresponding stage:
+//   PROPOSED  : block_id, parent_eth_hash, round, epoch, timestamp_ns
+//   VOTED     : block_id (others may be zero)
+//   FINALIZED : block_id, txn_count, gas_used (set from BlockEnd)
+//   VERIFIED  : block_id (others may be zero)
+//   REJECTED  : block_id, reason via stage = REJECTED
+message UpdateBlockMeta {
+  uint64     block_number        = 1;
+  string     block_id            = 2;   // 0x-hex 32 bytes; consensus block ID (proposal hash)
+  string     parent_eth_hash     = 3;   // 0x-hex 32 bytes; populated on PROPOSED
+  uint64     round               = 4;
+  uint64     epoch               = 5;
+  uint64     timestamp_ns        = 6;   // Block proposal time, nanoseconds since UNIX epoch (consensus clock)
+  BlockStage stage               = 7;
+  uint64     stage_changed_at_ns = 8;   // Server wall clock when this update was minted
+  uint32     txn_count           = 9;   // 0 until FINALIZED+
+  uint64     gas_used            = 10;  // 0 until FINALIZED+
+  // Why this block ended up at stage = REJECTED. Unset / UNSPECIFIED for
+  // any other stage.
+  AbandonReason abandon_reason   = 11;
+}
+
+// Per-event Update* messages each carry a `stage` field — the consensus
+// stage at which this event was emitted. The server re-emits the same
+// event at every stage transition (PROPOSED → VOTED → FINALIZED →
+// VERIFIED, plus REJECTED on implicit abandon); subscribers gate by
+// per-filter `min_stage` / `stages`.
+
+// ─── UpdateTxnHeader ───────────────────────────────────────────────
+//
+// One per transaction at the moment its header is admitted to a proposed
+// block (TxnHeaderStart). Carries the full signed transaction envelope.
+message UpdateTxnHeader {
+  uint64 block_number             = 1;
+  uint64 txn_index                = 2;
+  string txn_hash                 = 3;   // 0x-hex 32 bytes
+  string sender                   = 4;   // 0x-hex 20 bytes
+  uint32 txn_type                 = 5;
+  string chain_id                 = 6;   // 0x-hex U256
+  uint64 nonce                    = 7;
+  uint64 gas_limit                = 8;
+  string max_fee_per_gas          = 9;   // 0x-hex U256
+  string max_priority_fee_per_gas = 10;  // 0x-hex U256
+  string value                    = 11;  // 0x-hex U256
+  string data                     = 12;  // 0x-hex bytestring
+  string to                       = 13;  // 0x-hex 20 bytes; empty string when contract_creation
+  bool   is_contract_creation     = 14;
+  uint32 access_list_count        = 15;
+  uint32 auth_list_count          = 16;
+  BlockStage stage                = 17;
+}
+
+// ─── UpdateTxnLog ──────────────────────────────────────────────────
+//
+// One per emitted Solidity log. `topics` are split into individual 32-byte
+// entries (Ethereum allows 0–4).
+message UpdateTxnLog {
+  uint64 block_number = 1;
+  uint64 txn_index    = 2;
+  uint32 log_index    = 3;
+  string address      = 4;   // 0x-hex 20 bytes
+  repeated string topics = 5; // 0x-hex 32 bytes each
+  string data         = 6;   // 0x-hex bytestring
+  BlockStage stage    = 7;
+}
+
+// ─── UpdateTxnReceipt ──────────────────────────────────────────────
+//
+// One per transaction at the end of EVM execution (TxnEvmOutput).
+// `status` mirrors the EVM success bit; `log_count` is informational.
+message UpdateTxnReceipt {
+  uint64 block_number = 1;
+  uint64 txn_index    = 2;
+  bool   status       = 3;
+  uint64 gas_used     = 4;
+  uint32 log_count    = 5;
+  BlockStage stage    = 6;
+}
+
+// ─── UpdateCallFrame ───────────────────────────────────────────────
+//
+// One per EVM call frame (CALL / DELEGATECALL / STATICCALL / CREATE).
+// depth=0 is the top-level entry point. Internal calls climb the depth.
+message UpdateCallFrame {
+  uint64 block_number = 1;
+  uint64 txn_index    = 2;
+  uint32 depth        = 3;
+  string caller       = 4;   // 0x-hex 20 bytes
+  string call_target  = 5;   // 0x-hex 20 bytes
+  string value        = 6;   // 0x-hex U256
+  string input        = 7;   // 0x-hex bytestring
+  string output       = 8;   // 0x-hex bytestring
+  BlockStage stage    = 9;
+}
+
+// ─── UpdateBlockEnd ────────────────────────────────────────────────
+//
+// One per block at end of EVM execution (BlockEnd). Carries the canonical
+// Ethereum-equivalent block hash and the state/receipts roots needed for
+// proofs and bridges.
+message UpdateBlockEnd {
+  uint64 block_number   = 1;
+  string eth_block_hash = 2;  // 0x-hex 32 bytes
+  string state_root     = 3;  // 0x-hex 32 bytes
+  string receipts_root  = 4;  // 0x-hex 32 bytes
+  string logs_bloom     = 5;  // 0x-hex 256 bytes
+  uint64 gas_used       = 6;
+  BlockStage stage      = 7;
+}
+
+// ─── UpdateAccountAccess ───────────────────────────────────────────
+//
+// Snapshot of an account that an executing transaction touched.
+// txn_index is unset when the access is part of block-level setup.
+message UpdateAccountAccess {
+  uint64 block_number = 1;
+  uint64 txn_index    = 2;  // 0 when txn-less; pair with has_txn_index for
+                            // distinguishing system accesses.
+  bool   has_txn_index = 3;
+  string address      = 4;  // 0x-hex 20 bytes
+  string balance      = 5;  // 0x-hex U256
+  uint64 nonce        = 6;
+  string code_hash    = 7;  // 0x-hex 32 bytes
+  BlockStage stage    = 8;
+}
+
+// ─── UpdateStorageAccess ───────────────────────────────────────────
+//
+// One per storage slot read/write during execution. account_index refers
+// back to the AccountAccess block that established the account ordering
+// for this txn.
+message UpdateStorageAccess {
+  uint64 block_number  = 1;
+  uint64 txn_index     = 2;
+  bool   has_txn_index = 3;
+  uint64 account_index = 4;
+  string key           = 5;  // 0x-hex 32 bytes
+  string value         = 6;  // 0x-hex 32 bytes
+  BlockStage stage     = 7;
+}
+
+// ─── UpdateBlock ──────────────────────────────────────────────────
+//
+// Composite snapshot of an entire block at a particular consensus stage.
+// Emitted at every stage transition (PROPOSED / VOTED / FINALIZED /
+// VERIFIED) for a single block, sorted by txn_index. Contents are the
+// full block — meta + end + every txn / log / call frame / state access.
+//
+// Subscribers who want accounting-grade delivery (atomic, no reorg
+// risk) typically subscribe to FilterBlock and gate by min_stage =
+// BLOCK_STAGE_FINALIZED. Real-time per-event subscribers use
+// FilterTransactions / FilterLogs / etc. and see updates at PROPOSED
+// with low latency.
+message UpdateBlock {
+  uint64     block_number = 1;
+  string     block_id     = 2;
+  BlockStage stage        = 3;
+
+  UpdateBlockMeta              meta              = 4;
+  UpdateBlockEnd               end               = 5;   // unset on REJECTED
+  repeated UpdateTxnHeader     txn_headers       = 6;
+  repeated UpdateTxnReceipt    txn_receipts      = 7;
+  repeated UpdateTxnLog        txn_logs          = 8;
+  repeated UpdateCallFrame     call_frames       = 9;
+  repeated UpdateAccountAccess account_accesses  = 10;
+  repeated UpdateStorageAccess storage_accesses  = 11;
+}
+
+// ─── UpdateTxnReject ───────────────────────────────────────────────
+//
+// Emitted when a transaction is admitted into the mempool / proposed
+// block but rejected by validation before EVM execution (nonce mismatch,
+// signature failure, intrinsic-gas underflow, etc.).
+//
+// The SDK only surfaces a numeric `reason` code — clients map it to
+// human-readable strings off the SDK headers. For sender / `to`
+// context, subscribe alongside to `transactions` and correlate by
+// (block_number, txn_index).
+message UpdateTxnReject {
+  uint64     block_number = 1;
+  uint64     txn_index    = 2;
+  uint32     reason       = 3;
+  BlockStage stage        = 4;
+}
+
+// ─── UpdateEvmError ────────────────────────────────────────────────
+//
+// EVM execution finished with an error: revert, halt, out-of-gas,
+// invalid opcode, etc. Carries SDK numeric codes only.
+//
+// `txn_index` comes from the event ring `flow_info` — set when the
+// error occurred during a transaction; `has_txn_index = false` for
+// block-level errors (system / consensus path).
+message UpdateEvmError {
+  uint64     block_number  = 1;
+  uint64     txn_index     = 2;   // 0 when has_txn_index = false
+  bool       has_txn_index = 3;
+  uint64     domain_id     = 4;   // SDK domain (top-level error class)
+  int64     status_code    = 5;   // SDK status (specific error within domain)
+  BlockStage stage         = 6;
+}
+
+message Ping { uint64 nonce = 1; }
+message Pong { uint64 nonce = 1; }
+
+message PingRequest {}
+message PongResponse {
+  // Server wall clock, nanoseconds since UNIX epoch.
+  uint64 server_time_ns = 1;
+}
+
+message GetVersionRequest {}
+message GetVersionResponse {
+  string server_version = 1;  // monad-grpc-server semver
+  string sdk_tag        = 2;  // pinned tag of category-labs/monad-bft
+  uint32 proto_version  = 3;  // protocol major version
+}
