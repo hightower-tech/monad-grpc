@@ -19,7 +19,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GRPC_TARGET = process.argv[2] || "127.0.0.1:10000";
 const PROTO_PATH =
   process.argv[3] ||
-  path.resolve(__dirname, "../../grpc-proto/proto/monad.proto");
+  path.resolve(__dirname, "../proto/monad.proto");
 // x-token via env when the server is started with --x-token. argv stays
 // positional (target, proto) for backwards-compat with users from before
 // auth landed; pass MONAD_X_TOKEN=... if your server requires it.
